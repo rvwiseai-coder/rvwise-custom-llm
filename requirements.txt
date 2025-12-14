@@ -1,0 +1,10 @@
+streamlit
+llama-index
+llama-cloud-services
+python-dotenv
+openai
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+httpx
+python-multipart

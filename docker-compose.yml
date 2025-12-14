@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  rvwise-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rvwise-rag-api
+    ports:
+      - "8080:8080"
+    environment:
+      # LlamaCloud Configuration
+      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}
+      - LLAMA_CLOUD_ORG_ID=${LLAMA_CLOUD_ORG_ID:-14239941-881b-4efc-8ab8-9d223de0741e}
+      - LLAMA_CLOUD_INDEX_NAME=${LLAMA_CLOUD_INDEX_NAME:-RVwise RAG Knowledge Base}
+      - LLAMA_CLOUD_PROJECT_NAME=${LLAMA_CLOUD_PROJECT_NAME:-Default}
+      # OpenAI Configuration (if needed)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      # Port configuration
+      - PORT=8080
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - rvwise-network
+
+  # Optional: Streamlit UI service
+  rvwise-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: rvwise-rag-ui
+    ports:
+      - "8501:8501"
+    environment:
+      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}
+      - LLAMA_CLOUD_ORG_ID=${LLAMA_CLOUD_ORG_ID:-14239941-881b-4efc-8ab8-9d223de0741e}
+      - LLAMA_CLOUD_INDEX_NAME=${LLAMA_CLOUD_INDEX_NAME:-RVwise RAG Knowledge Base}
+      - LLAMA_CLOUD_PROJECT_NAME=${LLAMA_CLOUD_PROJECT_NAME:-Default}
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - rvwise-network
+    profiles:
+      - with-ui
+
+networks:
+  rvwise-network:
+    driver: bridge
