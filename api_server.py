@@ -18,20 +18,54 @@ from contextlib import asynccontextmanager
 from llama_cloud_services import LlamaCloudIndex
 from llama_index.core.agent.workflow import FunctionAgent, ToolCallResult, AgentStream
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
+from llama_index.core.memory import Memory
+from llama_index.core.llms import ChatMessage
 from llama_index.llms.openai import OpenAI
-from llama_index.core.workflow import Context
 from config import Config
+import hashlib
 
 # Initialize LlamaCloud index globally
 llama_index = None
 rag_agent = None
-ctx = None
+
+# Memory cache to avoid recreating memory for each request
+memory_cache = {}
+memory_last_access = {}
+MEMORY_CACHE_TTL = 1800  # 30 minutes in seconds
+
+
+async def cleanup_old_memories():
+    """Background task to clean up old memory cache entries"""
+    while True:
+        try:
+            current_time = time.time()
+            sessions_to_remove = []
+            
+            for session_id, last_access in memory_last_access.items():
+                if current_time - last_access > MEMORY_CACHE_TTL:
+                    sessions_to_remove.append(session_id)
+            
+            for session_id in sessions_to_remove:
+                if session_id in memory_cache:
+                    del memory_cache[session_id]
+                    del memory_last_access[session_id]
+                    print(f"🗑️ Cleaned up expired memory cache for session: {session_id}")
+            
+            await asyncio.sleep(300)  # Check every 5 minutes
+            
+        except Exception as e:
+            print(f"Error in memory cleanup: {e}")
+            await asyncio.sleep(300)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle - initialize resources on startup"""
-    global llama_index, rag_agent, ctx
+    global llama_index, rag_agent
+    
+    # Start background cleanup task
+    cleanup_task = asyncio.create_task(cleanup_old_memories())
+    
     try:
         Config.validate()
         llama_index = LlamaCloudIndex(
@@ -55,16 +89,13 @@ async def lifespan(app: FastAPI):
         rag_agent = FunctionAgent(
             llm=OpenAI(model=Config.OPENAI_MODEL, api_key=Config.OPENAI_API_KEY, streaming=True),
             tools=[query_engine_tool],
-            system_prompt="""You are an RV expert assistant with access to a comprehensive knowledge base about RV systems, troubleshooting, and maintenance.
-Always search the knowledge base to provide accurate, helpful responses based on the available information.
-If the knowledge base doesn't contain relevant information, indicate that clearly."""
+            system_prompt="""You are an assistant dedicated exclusively to answering questions about RVs (Recreational Vehicles), RV maintenance, RV travel, or RV accessories. For any question not directly related to these topics, politely respond: "I'm here to help with RV-related questions. Please ask about RVs, RV travel, or RV maintenance." For inappropriate or offensive questions, answer: "I'm sorry, I can't assist with that request." Do not answer unrelated or inappropriate questions.
+Give me a short, simple answer like a real person would, making sure to include all the necessary information."""
         )
-        
-        # Create a context for the agent
-        ctx = Context(rag_agent)
         
         print(f"✅ LlamaCloud Index initialized: {Config.LLAMA_CLOUD_INDEX_NAME}")
         print(f"✅ RAG Agent initialized with OpenAI model: {Config.OPENAI_MODEL}")
+        print(f"✅ Memory cache cleanup task started")
     except Exception as e:
         print(f"❌ Failed to initialize: {e}")
         import traceback
@@ -74,7 +105,8 @@ If the knowledge base doesn't contain relevant information, indicate that clearl
     
     yield
     
-    # Cleanup on shutdown if needed
+    # Cleanup on shutdown
+    cleanup_task.cancel()
     print("🔄 Shutting down API server...")
 
 # Create FastAPI app with lifespan management
@@ -146,6 +178,71 @@ def extract_user_query(messages: List[Message]) -> str:
     return ""
 
 
+def get_session_id_from_messages(messages: List[Message]) -> str:
+    """Generate a unique session ID based on the conversation context"""
+    # Create a hash from the first few messages to identify the session
+    session_data = ""
+    for msg in messages[:3]:  # Use first 3 messages for session identification
+        session_data += f"{msg.role}:{msg.content[:100]}"
+    
+    # Generate a short hash for the session ID
+    session_hash = hashlib.sha256(session_data.encode()).hexdigest()[:16]
+    return f"session_{session_hash}"
+
+
+def get_or_update_memory(messages: List[Message]) -> Memory:
+    """Get cached memory or create/update if needed"""
+    global memory_cache, memory_last_access
+    
+    # Generate session ID from messages
+    session_id = get_session_id_from_messages(messages)
+    
+    # Update last access time
+    memory_last_access[session_id] = time.time()
+    
+    # Check if we have a cached memory for this session
+    if session_id in memory_cache:
+        cached_memory, cached_message_count = memory_cache[session_id]
+        
+        # Check if the message count matches (no new messages)
+        if cached_message_count == len(messages):
+            print(f"♻️ Using cached memory for session: {session_id}")
+            return cached_memory
+        
+        # We have new messages, update the existing memory
+        print(f"📝 Updating memory for session: {session_id} ({cached_message_count} -> {len(messages)} messages)")
+        
+        # Add only the new messages to the existing memory
+        new_messages = []
+        for msg in messages[cached_message_count:]:
+            new_messages.append(ChatMessage(role=msg.role, content=msg.content))
+        
+        if new_messages:
+            cached_memory.put_messages(new_messages)
+        
+        # Update cache with new message count
+        memory_cache[session_id] = (cached_memory, len(messages))
+        return cached_memory
+    
+    # No cached memory, create new one
+    print(f"🆕 Creating new memory for session: {session_id}")
+    memory = Memory.from_defaults(session_id=session_id, token_limit=40000)
+    
+    # Convert all messages to ChatMessages
+    chat_messages = []
+    for msg in messages:
+        chat_messages.append(ChatMessage(role=msg.role, content=msg.content))
+    
+    # Put all messages into memory
+    if chat_messages:
+        memory.put_messages(chat_messages)
+    
+    # Cache the memory with message count
+    memory_cache[session_id] = (memory, len(messages))
+    
+    return memory
+
+
 def format_context_from_sources(nodes) -> str:
     """Format retrieved sources into context for the LLM"""
     if not nodes:
@@ -177,38 +274,43 @@ def format_context_from_sources(nodes) -> str:
     return "\n".join(context_parts)
 
 
-async def generate_rag_response(query: str, messages: List[Message]) -> tuple[str, list]:
-    """
-    Force RAG retrieval every time using LlamaCloud (managed)
-    """
-    if not llama_index:
-        return "I’m unable to access the knowledge base right now.", []
-
+async def generate_rag_response(query: str, messages: List[Message]) -> tuple[str, List[Any]]:
+    """Generate response using RAG agent (non-streaming)"""
+    print(f"Generating response using RAG Agent for query: {query}")
+    if not rag_agent or not llama_index:
+        return "RAG system is not available. Please check the configuration.", []
+    
     try:
-        # ✅ Let LlamaCloud manage retrieval + inference
-        query_engine = llama_index.as_query_engine()
-        response = query_engine.query(query)
-
-        answer = str(response).strip()
-
-        if not answer or len(answer) < 30:
-            return (
-                "I’m not finding detailed references in the knowledge base right now, "
-                "but I can still help based on RV best practices.",
-                []
-            )
-
-        return answer, []
-
+        chat_history = None
+        
+        if len(messages) > 1:
+            # Get or update cached memory (excluding current query)
+            memory = get_or_update_memory(messages[:-1])
+            chat_history = memory.get()
+            print(f"📚 Using chat history with {len(chat_history)} messages")
+        
+        # Run the agent with the query and chat history
+        if chat_history:
+            # Pass chat history to override any existing memory
+            handler = await rag_agent.run(query, chat_history=chat_history)
+        else:
+            # No history, just run with the query
+            handler = await rag_agent.run(query)
+        
+        # Collect the full response from the stream
+        full_response = str(handler)
+        
+        # For now, we don't have direct access to nodes from the agent
+        # This would require modifying the agent to expose the retrieved nodes
+        nodes = []
+        
+        return full_response, nodes
+        
     except Exception as e:
-        print("❌ RAG query failed (LlamaCloud)")
-        print(e)
-        return (
-            "I’m having trouble accessing the knowledge base at the moment.",
-            []
-        )
-
-
+        print(f"❌ Error generating response: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return f"Error generating response: {str(e)}", []
 
 
 def estimate_tokens(text: str) -> int:
@@ -235,24 +337,21 @@ async def stream_rag_response(query: str, messages: List[Message], request_id: s
         return
     
     try:
-        # Build conversation context from messages
-        conversation_context = ""
-#         if len(messages) > 1:
-#             for msg in messages[:-1]:  # Exclude current query
-#                 conversation_context += f"{msg.role}: {msg.content}\n"
-            
-#             # Enhance query with conversation context
-#             enhanced_query = f"""Previous conversation:
-# {conversation_context}
-
-# Current question: {query}
-
-# Please provide a response that takes into account the conversation history above."""
-#         else:
-#             enhanced_query = query
+        chat_history = None
         
-        # Run the agent with the query
-        handler = rag_agent.run(query, ctx=ctx)
+        if len(messages) > 1:
+            # Get or update cached memory (excluding current query)
+            memory = get_or_update_memory(messages[:-1])
+            chat_history = memory.get()
+            print(f"📚 Streaming with chat history containing {len(chat_history)} messages")
+        
+        # Run the agent with the query and chat history
+        if chat_history:
+            # Pass chat history to override any existing memory
+            handler = rag_agent.run(query, chat_history=chat_history)
+        else:
+            # No history, just run with the query
+            handler = rag_agent.run(query)
         
         # Stream the response chunks
         async for ev in handler.stream_events():
