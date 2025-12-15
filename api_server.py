@@ -179,19 +179,25 @@ def format_context_from_sources(nodes) -> str:
 
 async def generate_rag_response(query: str, messages: List[Message]) -> tuple[str, list]:
     """
-    Force RAG retrieval every time (no agent decision-making)
+    Force RAG retrieval every time using LlamaCloud
     """
     if not llama_index:
         return "I’m unable to access the knowledge base right now.", []
 
     try:
-        # 🔑 Force retrieval from LlamaCloud
-        query_engine = llama_index.as_query_engine()
-        response = query_engine.query(query)
+        from llama_index.llms.openai import OpenAI
 
+        # 🔑 Force retrieval with explicit LLM
+        query_engine = llama_index.as_query_engine(
+            llm=OpenAI(
+                model=Config.OPENAI_MODEL,
+                api_key=Config.OPENAI_API_KEY,
+            )
+        )
+
+        response = query_engine.query(query)
         answer = str(response).strip()
 
-        # If retrieval is weak or empty, fall back gracefully
         if not answer or len(answer) < 30:
             return (
                 "I’m having trouble pulling detailed references right now, "
@@ -207,6 +213,7 @@ async def generate_rag_response(query: str, messages: List[Message]) -> tuple[st
             "I’m having trouble accessing the knowledge base at the moment.",
             []
         )
+
 
 
 def estimate_tokens(text: str) -> int:
