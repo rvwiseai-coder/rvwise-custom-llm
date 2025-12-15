@@ -177,45 +177,36 @@ def format_context_from_sources(nodes) -> str:
     return "\n".join(context_parts)
 
 
-async def generate_rag_response(query: str, messages: List[Message]) -> tuple[str, List[Any]]:
-    """Generate response using RAG agent (non-streaming)"""
-    print(f"Generating response using RAG Agent for query: {query}")
-    if not rag_agent or not llama_index:
-        return "RAG system is not available. Please check the configuration.", []
-    
+async def generate_rag_response(query: str, messages: List[Message]) -> tuple[str, list]:
+    """
+    Force RAG retrieval every time (no agent decision-making)
+    """
+    if not llama_index:
+        return "I’m unable to access the knowledge base right now.", []
+
     try:
-        # Build conversation context
-        conversation_context = ""
-        if len(messages) > 1:
-            for msg in messages[:-1]:
-                conversation_context += f"{msg.role}: {msg.content}\n"
-            
-            enhanced_query = f"""Previous conversation:
-{conversation_context}
+        # 🔑 Force retrieval from LlamaCloud
+        query_engine = llama_index.as_query_engine()
+        response = query_engine.query(query)
 
-Current question: {query}
+        answer = str(response).strip()
 
-Please provide a response that takes into account the conversation history above."""
-        else:
-            enhanced_query = query
-        
-        # Run the agent and collect the full response
-        handler = await rag_agent.run(enhanced_query, ctx=ctx)
-        
-        # Collect the full response from the stream
-        full_response = str(handler)
-        
-        # For now, we don't have direct access to nodes from the agent
-        # This would require modifying the agent to expose the retrieved nodes
-        nodes = []
-        
-        return full_response, nodes
-        
+        # If retrieval is weak or empty, fall back gracefully
+        if not answer or len(answer) < 30:
+            return (
+                "I’m having trouble pulling detailed references right now, "
+                "but I can still help based on RV best practices.",
+                []
+            )
+
+        return answer, []
+
     except Exception as e:
-        print(f"❌ Error generating response: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return f"Error generating response: {str(e)}", []
+        print(f"❌ RAG query failed: {e}")
+        return (
+            "I’m having trouble accessing the knowledge base at the moment.",
+            []
+        )
 
 
 def estimate_tokens(text: str) -> int:
